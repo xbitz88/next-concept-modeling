@@ -90,6 +90,11 @@ class NextConceptTransformer(Transformer):
         self._lvl_first = 0 if self.query_level0 else 1
         T = self.L if self.query_level0 else self.L - self.levels[0]
         P = config.prefix_len
+        # Read optional flags once: getattr on a missing DictConfig key raises and swallows an exception whose
+        # traceback cycles back to the caller's frame, so doing it in generate() kept every call's tensors alive
+        # until the cyclic GC ran.
+        self.raw_token_prefix = bool(getattr(config, 'raw_token_prefix', False))
+        self.contextual_prefix = bool(getattr(config, 'contextual_prefix', False))
 
         # Per-level RoPE: prefix at [0..P-1], each target chunk reset to [0..l_k-1].
         self.use_rope = bool(getattr(config, 'use_rope', False))
@@ -474,28 +479,61 @@ class NextConceptTransformer(Transformer):
         for block in self.transformer.blocks:
             block.attn.kv_caching(enable)
 
-    def _sample_level(self, logits, temperature, top_k, top_p):
+    def _kv_prefix(self, h, mask, rope):
+        """Encode a fixed prefix once; retain each layer's rotated keys/values."""
+        kv = []
+        for block in self.transformer.blocks:
+            h, layer_kv = block(h, attn_mask=mask, rope_cos_sin=rope, return_kv=True)
+            kv.append(layer_kv)
+        return h, kv
+
+    def _kv_level(self, x, prefix_kv, mask, rope, hidx):
+        """Decode only this level, without appending its changing K/V to the prefix."""
+        for block, layer_kv in zip(self.transformer.blocks, prefix_kv):
+            x = block(x, attn_mask=mask, rope_cos_sin=rope, past_kv=layer_kv)
+        return self.lm_heads[hidx](self.transformer.ln_f(x))
+
+    def _guided_logits(self, logits):
         _c = getattr(self, "_cfg", None)
         if _c is not None and _c["scale"] > 0.0:
             B = _c["B"]
             t = _c["scale"] * (_c["level"] / max(_c["nlev"] - 1, 1))
-            logits = (1.0 + t) * logits[:B] - t * logits[B:]
-            pred = self._sample_level_raw(logits, temperature, top_k, top_p)
+            return (1.0 + t) * logits[:B] - t * logits[B:]
+        return logits
+
+    def _sample_level(self, logits, temperature, top_k, top_p):
+        pred = self._sample_level_raw(self._guided_logits(logits), temperature, top_k, top_p)
+        if getattr(self, "_cfg", None) is not None and self._cfg["scale"] > 0.0:
             return torch.cat([pred, pred], dim=0)
-        return self._sample_level_raw(logits, temperature, top_k, top_p)
+        return pred
+
+    def _soft_code_embedding(self, logits, level_idx, soft_temperature):
+        """Compute guided codebook expectations in FP32, before hard sampling filters."""
+        logits = self._guided_logits(logits)
+        with torch.autocast(device_type=logits.device.type, enabled=False):
+            probabilities = (logits.float() / soft_temperature).softmax(dim=-1)
+            embedding = probabilities @ self.vqvae_local[0].vq.embeddings[level_idx].weight.float()
+        if getattr(self, "_cfg", None) is not None and self._cfg["scale"] > 0.0:
+            embedding = torch.cat([embedding, embedding], dim=0)
+        return embedding
 
     def _sample_level_raw(self, logits, temperature, top_k, top_p):
         if temperature == 0:
             return logits.argmax(dim=-1)
         logits_flat = logits.reshape(-1, logits.shape[-1]) / temperature
         if top_k > 0:
-            kth = torch.topk(logits_flat, top_k, dim=-1).values[:, -1, None]
+            # Only the cutoff is needed; the top-k values need not be sorted.
+            top_values = torch.topk(logits_flat, top_k, dim=-1, sorted=False).values
+            kth = top_values.amin(dim=-1, keepdim=True)
             logits_flat = logits_flat.masked_fill(logits_flat < kth, -torch.inf)
-        sorted_logits, sorted_idx = torch.sort(logits_flat, dim=-1, descending=True)
-        cumprobs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-        remove = cumprobs - F.softmax(sorted_logits, dim=-1) > top_p
-        sorted_logits = sorted_logits.masked_fill(remove, -torch.inf)
-        logits_flat = torch.zeros_like(logits_flat).scatter_(-1, sorted_idx, sorted_logits)
+        # Unrestricted ancestral sampling (top_p=1) needs no nucleus sort.
+        if top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(logits_flat, dim=-1, descending=True)
+            sorted_probs = F.softmax(sorted_logits, dim=-1)
+            cumprobs = torch.cumsum(sorted_probs, dim=-1)
+            remove = cumprobs - sorted_probs > top_p
+            sorted_logits = sorted_logits.masked_fill(remove, -torch.inf)
+            logits_flat = torch.zeros_like(logits_flat).scatter_(-1, sorted_idx, sorted_logits)
         return torch.multinomial(F.softmax(logits_flat, dim=-1), num_samples=1).view(logits.shape[:-1])
 
     def _decode_level_logits(self, x, prefix_emb, level_idx, pad_bias=None, hidx=None):
@@ -519,9 +557,17 @@ class NextConceptTransformer(Transformer):
 
     @torch.no_grad()
     def generate(self, idx, prefix_tokens, temperature=1.0, top_k=50, top_p=0.9,
-                 use_kv_cache=False, cfg_scale=0.0, cfg_null_eos=50256):
-        assert not (self.query_level0 and use_kv_cache), \
-            "query_level0 generation supports the eager path only"
+                 use_kv_cache=True, cfg_scale=0.0, cfg_null_eos=50256,
+                 soft_decisions=False, soft_temperature=1.0, return_latent=False,
+                 return_trajectory=False):
+        """Generate with request-local prefix caching; soft decisions require return_latent=True.
+        Returned latents are [B, L, D], or [B, K, L, D] with return_trajectory=True."""
+        if soft_decisions and not return_latent:
+            raise ValueError("soft_decisions requires return_latent=True; decode the returned latent")
+        if return_trajectory and not return_latent:
+            raise ValueError("return_trajectory requires return_latent=True")
+        if soft_decisions and (not math.isfinite(soft_temperature) or soft_temperature <= 0):
+            raise ValueError("soft_temperature must be finite and greater than zero")
 
         dev = prefix_tokens.device
 
@@ -542,13 +588,14 @@ class NextConceptTransformer(Transformer):
         B = prefix_tokens.shape[0]
         vq = self.vqvae_local[0].vq
         z_hat = torch.zeros(B, self.levels[-1], self.vqvae_local[0].embed_dim, device=dev)
+        trajectory = [] if return_trajectory else None
 
         if self.use_ctx_encoder:
             prefix_emb = self._encode_context(prefix_tokens[:, :self.prefix_len])
         else:
-            if bool(getattr(self.config, 'raw_token_prefix', False)):
+            if self.raw_token_prefix:
                 _enc = self.vqvae_local[0].encoder
-                if bool(getattr(self.config, 'contextual_prefix', False)) and \
+                if self.contextual_prefix and \
                         len(getattr(_enc, 'blocks', [])) > 0:
                     z_prefix = _enc.forward_nopos(prefix_tokens)[:, :self.prefix_len, :]
                 else:
@@ -568,15 +615,15 @@ class NextConceptTransformer(Transformer):
             level_pos_embed = level_pos_embed + self.wpe(self.wp_1L)
 
         P = self.prefix_len
+        prefix_kv = None
+        soft_embedding = None
 
         _pbias = None
         if self.prefix_pad_id is not None:
             _pm = (prefix_tokens[:, :P] == self.prefix_pad_id)
             _pbias = torch.zeros(_pm.shape[0], 1, 1, P, device=dev)
-            _pbias[:, :, :, :P] = torch.where(
-                _pm[:, None, None, :],
-                torch.tensor(float('-inf'), device=dev),
-                torch.tensor(0.0, device=dev))
+            # Avoid host scalar transfers during CUDA graph capture.
+            _pbias.masked_fill_(_pm[:, None, None, :], float('-inf'))
 
         if idx is None and self.query_level0:
             l0 = self.levels[0]
@@ -600,31 +647,54 @@ class NextConceptTransformer(Transformer):
             if self.l0_ar:
                 _E0 = vq.embeddings[0]
                 base_q = self.build_l0_query_input(B, prefix_emb.dtype)
-                x_in, codes = base_q, []
+                x_in, codes, soft_codes = base_q, [], []
                 for t in range(l0):
                     q = self.transformer.wte(x_in)
                     if not self.use_rope:
                         q = q + self.wpe(self.wp_1L[:, :l0])
                     if self.config.use_level_encoding:
                         q = q + self.transformer.wle(self.lvl_1L[:, :l0])
-                    h = torch.cat([prefix_emb, q], dim=1)
-                    for block in self.transformer.blocks:
-                        h = block(h, attn_mask=m0, rope_cos_sin=rope_0)
-                    h = self.transformer.ln_f(h)
+                    if use_kv_cache and prefix_kv is not None:
+                        logits = self._kv_level(q, prefix_kv, m0[:, :, P:, :], rope_0, 0)
+                    else:
+                        h = torch.cat([prefix_emb, q], dim=1)
+                        if use_kv_cache:
+                            h, layer_kv = self._kv_prefix(h, m0, rope_0)
+                            prefix_kv = [(k[:, :, :P].contiguous(), v[:, :, :P].contiguous())
+                                         for k, v in layer_kv]
+                        else:
+                            for block in self.transformer.blocks:
+                                h = block(h, attn_mask=m0, rope_cos_sin=rope_0)
+                        logits = self.lm_heads[0](self.transformer.ln_f(h)[:, P:, :])
                     codes.append(self._sample_level(
-                        self.lm_heads[0](h[:, P + t:P + t + 1, :]),
+                        logits[:, t:t + 1, :],
                         temperature, top_k, top_p))
+                    if soft_decisions:
+                        soft_codes.append(self._soft_code_embedding(logits[:, t:t + 1, :], 0, soft_temperature))
                     if t + 1 < l0:
                         known = torch.cat(codes, dim=1)
-                        x_in = torch.cat([base_q[:, :1], _E0(known).to(base_q.dtype),
+                        known_embedding = torch.cat(soft_codes, dim=1) if soft_decisions else _E0(known)
+                        x_in = torch.cat([base_q[:, :1], known_embedding.to(base_q.dtype),
                                           base_q[:, t + 2:]], dim=1)
                 idx = torch.cat(codes, dim=1)
+                if soft_decisions:
+                    soft_embedding = torch.cat(soft_codes, dim=1)
             else:
-                for block in self.transformer.blocks:
-                    h = block(h, attn_mask=m0, rope_cos_sin=rope_0)
+                if use_kv_cache:
+                    # Prefix rows cannot see level-zero queries. Their K/V
+                    # from this first pass can serve every later level.
+                    h, layer_kv = self._kv_prefix(h, m0, rope_0)
+                    prefix_kv = [(k[:, :, :P].contiguous(), v[:, :, :P].contiguous())
+                                 for k, v in layer_kv]
+                else:
+                    for block in self.transformer.blocks:
+                        h = block(h, attn_mask=m0, rope_cos_sin=rope_0)
                 h = self.transformer.ln_f(h)
                 if self._cfg is not None: self._cfg["level"] = 0
-                idx = self._sample_level(self.lm_heads[0](h[:, P:, :]), temperature, top_k, top_p)
+                logits = self.lm_heads[0](h[:, P:, :])
+                idx = self._sample_level(logits, temperature, top_k, top_p)
+                if soft_decisions:
+                    soft_embedding = self._soft_code_embedding(logits, 0, soft_temperature)
 
         if idx is None:
             assert self.predict_level0, "generate(idx=None) requires model.predict_level0 or query_level0"
@@ -633,72 +703,76 @@ class NextConceptTransformer(Transformer):
             pfx_mask = torch.zeros(1, 1, P, P, device=dev)
             if _pbias is not None:
                 pfx_mask = pfx_mask + _pbias
-            for block in self.transformer.blocks:
-                h = block(h, attn_mask=pfx_mask, rope_cos_sin=rope_p)
+            if use_kv_cache:
+                h, prefix_kv = self._kv_prefix(h, pfx_mask, rope_p)
+            else:
+                for block in self.transformer.blocks:
+                    h = block(h, attn_mask=pfx_mask, rope_cos_sin=rope_p)
             h = self.transformer.ln_f(h)
             l0_logits = self.lm_head_l0(self._level0_slice(h, _pm if self.prefix_pad_id is not None else None))
             if self._cfg is not None: self._cfg["level"] = 0
             idx = self._sample_level(l0_logits, temperature, top_k, top_p)
+            if soft_decisions:
+                soft_embedding = self._soft_code_embedding(l0_logits, 0, soft_temperature)
 
         generated_idx = [idx]
         idx_next = idx
-        if use_kv_cache:
-            self._set_kv_caching(True)
+        if use_kv_cache and prefix_kv is None:
+            # The caller supplied level-zero codes, so build the prefix here.
+            rope_p = (self.rope_cos_gen_0, self.rope_sin_gen_0) if self.use_rope else None
+            pfx_mask = torch.zeros(1, 1, P, P, device=prefix_emb.device)
+            if _pbias is not None:
+                pfx_mask = pfx_mask + _pbias
+            _, prefix_kv = self._kv_prefix(prefix_emb, pfx_mask, rope_p)
 
-        try:
+        level_acum = self.levels[0] if self.query_level0 else 0
+        for level_idx in range(len(self.levels)-1):
+            if self._cfg is not None:
+                self._cfg["level"] = level_idx + 1
+
+            z_q_level = soft_embedding if soft_embedding is not None else vq.embeddings[level_idx](idx_next)
+            z_hat, x = vq.get_next_autoregressive_input(level_idx, z_hat, z_q_level)
+            if return_trajectory:
+                trajectory.append(z_hat.clone())
+
+            if self.use_post_upsample_conv:
+                x = self._apply_post_upsample_conv_single(x, level_idx + (1 - self._lvl_first))
+
+            x = self.transformer.wte(x) + level_pos_embed[:, level_acum:level_acum + self.levels[level_idx+1], :]
+
+            L_cur = self.levels[level_idx + 1]
+            # Heads and RoPE buffers are indexed by absolute level when level 0 occupies slot 0.
+            _hi = level_idx + (1 - self._lvl_first)
+            rope_k = (
+                getattr(self, f'rope_cos_gen_{_hi}'),
+                getattr(self, f'rope_sin_gen_{_hi}'),
+            ) if self.use_rope else None
+
             if use_kv_cache:
-                rope_p = (
-                    self.rope_cos_gen_0, self.rope_sin_gen_0,
-                ) if self.use_rope else None
-                h = prefix_emb
-                pfx_mask = torch.zeros(1, 1, P, P, device=prefix_emb.device)
-                for block in self.transformer.blocks:
-                    h = block(h, attn_mask=pfx_mask, rope_cos_sin=rope_p)
-                prefix_kv = [(b.attn.cached_k, b.attn.cached_v) for b in self.transformer.blocks]
+                lvl_mask = torch.zeros(1, 1, L_cur, P + L_cur, device=x.device)
+                if _pbias is not None:
+                    lvl_mask = lvl_mask + F.pad(_pbias, (0, L_cur))
+                logits = self._kv_level(x, prefix_kv, lvl_mask, rope_k, _hi)
+                idx_next = self._sample_level(logits, temperature, top_k, top_p)
+            else:
+                logits = self._decode_level_logits(x, prefix_emb, level_idx, _pbias, hidx=_hi)
+                idx_next = self._sample_level(logits, temperature, top_k, top_p)
+            if soft_decisions:
+                soft_embedding = self._soft_code_embedding(logits, level_idx + 1, soft_temperature)
 
-            level_acum = self.levels[0] if self.query_level0 else 0
-            for level_idx in range(len(self.levels)-1):
-                if self._cfg is not None:
-                    self._cfg["level"] = level_idx + 1
-
-                z_q_level = vq.embeddings[level_idx](idx_next)
-                z_hat, x = vq.get_next_autoregressive_input(level_idx, z_hat, z_q_level)
-
-                if self.use_post_upsample_conv:
-                    x = self._apply_post_upsample_conv_single(x, level_idx + (1 - self._lvl_first))
-
-                x = self.transformer.wte(x) + level_pos_embed[:, level_acum:level_acum + self.levels[level_idx+1], :]
-
-                L_cur = self.levels[level_idx + 1]
-                # Heads and RoPE buffers are indexed by absolute level when level 0 occupies slot 0.
-                _hi = level_idx + (1 - self._lvl_first)
-                rope_k = (
-                    getattr(self, f'rope_cos_gen_{_hi}'),
-                    getattr(self, f'rope_sin_gen_{_hi}'),
-                ) if self.use_rope else None
-
-                if use_kv_cache:
-                    for blk, (pk, pv) in zip(self.transformer.blocks, prefix_kv):
-                        blk.attn.cached_k, blk.attn.cached_v = pk, pv
-                    lvl_mask = torch.zeros(1, 1, L_cur, P + L_cur, device=x.device)
-                    for block in self.transformer.blocks:
-                        x = block(x, attn_mask=lvl_mask, rope_cos_sin=rope_k)
-                    x = self.transformer.ln_f(x)
-                    logits = self.lm_heads[_hi](x)
-                    idx_next = self._sample_level(logits, temperature, top_k, top_p)
-                else:
-                    logits = self._decode_level_logits(x, prefix_emb, level_idx, _pbias, hidx=_hi)
-                    idx_next = self._sample_level(logits, temperature, top_k, top_p)
-
-                generated_idx.append(idx_next)
-                level_acum += self.levels[level_idx+1]
-        finally:
-            if use_kv_cache:
-                self._set_kv_caching(False)
-
+            generated_idx.append(idx_next)
+            level_acum += self.levels[level_idx+1]
         out = torch.cat(generated_idx, dim=1)
+        if return_latent:
+            last = len(self.levels) - 1
+            z_q_level = soft_embedding if soft_embedding is not None else vq.embeddings[last](idx_next)
+            z_hat, _ = vq.get_next_autoregressive_input(last, z_hat, z_q_level)
+            if return_trajectory:
+                trajectory.append(z_hat.clone())
+                z_hat = torch.stack(trajectory, dim=1)
         if self._cfg is not None:
             out = out[:self._cfg["B"]]
+            if return_latent:
+                z_hat = z_hat[:self._cfg["B"]]
         self._cfg = None
-        return out
-    
+        return (out, z_hat) if return_latent else out
